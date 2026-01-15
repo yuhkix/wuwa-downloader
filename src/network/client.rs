@@ -2,7 +2,7 @@ use colored::Colorize;
 use flate2::read::GzDecoder;
 use indicatif::{ProgressBar, ProgressStyle};
 use reqwest::blocking::Client;
-use serde_json::{Value, from_reader, from_str};
+use serde_json::{Value, from_str};
 #[cfg(not(target_os = "windows"))]
 use std::process::Command;
 use std::{
@@ -25,27 +25,58 @@ use crate::io::{logging::log_error, util::get_version};
 const INDEX_URL: &str = "https://gist.githubusercontent.com/yuhkix/b8796681ac2cd3bab11b7e8cdc022254/raw/4435fd290c07f7f766a6d2ab09ed3096d83b02e3/wuwa.json";
 const MAX_RETRIES: usize = 3;
 const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(10000);
-const BUFFER_SIZE: usize = 65536;
+const BUFFER_SIZE: usize = 262144;
+
+fn handle_http_error(log_file: &fs::File, error_msg: &str) -> ! {
+    log_error(log_file, error_msg);
+
+    #[cfg(windows)]
+    clear().unwrap();
+
+    println!("{} {}", Status::error(), error_msg);
+    println!("\n{} Press Enter to exit...", Status::warning());
+    let _ = io::stdin().read_line(&mut String::new());
+    std::process::exit(1);
+}
+
+fn decompress_if_gzipped(response: reqwest::blocking::Response) -> Result<String, String> {
+    let content_encoding = response
+        .headers()
+        .get("content-encoding")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+
+    if content_encoding.contains("gzip") {
+        let mut buffer = Vec::new();
+        let mut resp = response;
+        resp.copy_to(&mut buffer)
+            .map_err(|e| format!("Error reading response bytes: {}", e))?;
+
+        let mut gz = GzDecoder::new(&buffer[..]);
+        let mut decompressed_text = String::new();
+        gz.read_to_string(&mut decompressed_text)
+            .map_err(|e| format!("Error decompressing: {}", e))?;
+        Ok(decompressed_text)
+    } else {
+        response
+            .text()
+            .map_err(|e| format!("Error reading response: {}", e))
+    }
+}
 
 pub fn fetch_index(client: &Client, config: &Config, log_file: &fs::File) -> Value {
     println!("{} Fetching index file...", Status::info());
 
-    let mut response = match client
+    let response = match client
         .get(&config.index_url)
         .timeout(Duration::from_secs(30))
         .send()
     {
         Ok(resp) => resp,
         Err(e) => {
-            log_error(log_file, &format!("Error fetching index file: {}", e));
-
-            #[cfg(windows)]
-            clear().unwrap();
-
-            println!("{} Error fetching index file: {}", Status::error(), e);
-            println!("\n{} Press Enter to exit...", Status::warning());
-            let _ = io::stdin().read_line(&mut String::new());
-            std::process::exit(1);
+            let msg = format!("Error fetching index file: {}", e);
+            handle_http_error(log_file, &msg);
         }
     };
 
@@ -62,57 +93,11 @@ pub fn fetch_index(client: &Client, config: &Config, log_file: &fs::File) -> Val
         std::process::exit(1);
     }
 
-    let content_encoding = response
-        .headers()
-        .get("content-encoding")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("");
-
-    let text = if content_encoding.contains("gzip") {
-        let mut buffer = Vec::new();
-        if let Err(e) = response.copy_to(&mut buffer) {
-            log_error(log_file, &format!("Error reading index file bytes: {}", e));
-
-            #[cfg(windows)]
-            clear().unwrap();
-
-            println!("{} Error reading index file: {}", Status::error(), e);
-            println!("\n{} Press Enter to exit...", Status::warning());
-            let _ = io::stdin().read_line(&mut String::new());
-            std::process::exit(1);
-        }
-
-        let mut gz = GzDecoder::new(&buffer[..]);
-        let mut decompressed_text = String::new();
-        if let Err(e) = gz.read_to_string(&mut decompressed_text) {
-            log_error(log_file, &format!("Error decompressing index file: {}", e));
-
-            #[cfg(windows)]
-            clear().unwrap();
-
-            println!("{} Error decompressing index file: {}", Status::error(), e);
-            println!("\n{} Press Enter to exit...", Status::warning());
-            let _ = io::stdin().read_line(&mut String::new());
-            std::process::exit(1);
-        }
-        decompressed_text
-    } else {
-        match response.text() {
-            Ok(t) => t,
-            Err(e) => {
-                log_error(
-                    log_file,
-                    &format!("Error reading index file response: {}", e),
-                );
-
-                #[cfg(windows)]
-                clear().unwrap();
-
-                println!("{} Error reading index file: {}", Status::error(), e);
-                println!("\n{} Press Enter to exit...", Status::warning());
-                let _ = io::stdin().read_line(&mut String::new());
-                std::process::exit(1);
-            }
+    let text = match decompress_if_gzipped(response) {
+        Ok(t) => t,
+        Err(e) => {
+            let msg = format!("Error processing index file: {}", e);
+            handle_http_error(log_file, &msg);
         }
     };
 
@@ -121,15 +106,8 @@ pub fn fetch_index(client: &Client, config: &Config, log_file: &fs::File) -> Val
     match from_str(&text) {
         Ok(v) => v,
         Err(e) => {
-            log_error(log_file, &format!("Error parsing index file JSON: {}", e));
-
-            #[cfg(windows)]
-            clear().unwrap();
-
-            println!("{} Error parsing index file: {}", Status::error(), e);
-            println!("\n{} Press Enter to exit...", Status::warning());
-            let _ = io::stdin().read_line(&mut String::new());
-            std::process::exit(1);
+            let msg = format!("Error parsing index file JSON: {}", e);
+            handle_http_error(log_file, &msg);
         }
     }
 }
@@ -337,7 +315,10 @@ fn download_single_file(
             .len();
     }
 
-    let request = client.get(url).timeout(DOWNLOAD_TIMEOUT);
+    let request = client
+        .get(url)
+        .timeout(DOWNLOAD_TIMEOUT)
+        .header("Connection", "keep-alive");
 
     let request = if downloaded > 0 {
         request.header("Range", format!("bytes={}-", downloaded))
@@ -369,7 +350,7 @@ fn download_single_file(
         .downloaded_bytes
         .store(downloaded, std::sync::atomic::Ordering::SeqCst);
 
-    let mut buffer = [0; BUFFER_SIZE];
+    let mut buffer = vec![0; BUFFER_SIZE];
     loop {
         if should_stop.load(std::sync::atomic::Ordering::SeqCst) {
             return Err("Download interrupted".into());
@@ -396,7 +377,99 @@ fn download_single_file(
     Ok(())
 }
 
+pub fn ask_download_mode(_client: &Client) -> Result<String, String> {
+    println!("\n{} Download Mode Selection", Status::info());
+    println!("{} 1. Latest game versions (from official sources)", Status::question());
+    println!("{} 2. Custom version (provide resource URLs)", Status::question());
+
+    loop {
+        print!("\n{} Choose download mode (1 or 2): ", Status::question());
+        io::stdout()
+            .flush()
+            .map_err(|e| format!("Failed to flush stdout: {}", e))?;
+
+        let mut input = String::new();
+        io::stdin()
+            .read_line(&mut input)
+            .map_err(|e| format!("Failed to read input: {}", e))?;
+
+        match input.trim() {
+            "1" => {
+                return Ok("latest".to_string());
+            }
+            "2" => {
+                return Ok("custom".to_string());
+            }
+            _ => println!("{} Invalid choice, please enter 1 or 2", Status::error()),
+        }
+    }
+}
+
+pub fn get_custom_config(_client: &Client) -> Result<Config, String> {
+    println!("\n{} Custom Version Configuration", Status::info());
+
+    print!("{} Enter resource.json URL: ", Status::question());
+    io::stdout()
+        .flush()
+        .map_err(|e| format!("Failed to flush stdout: {}", e))?;
+
+    let mut index_url = String::new();
+    io::stdin()
+        .read_line(&mut index_url)
+        .map_err(|e| format!("Failed to read input: {}", e))?;
+
+    let index_url = index_url.trim();
+    if index_url.is_empty() {
+        return Err("Resource JSON URL cannot be empty".to_string());
+    }
+
+    let index_url = if index_url.starts_with("http://") || index_url.starts_with("https://") {
+        index_url.to_string()
+    } else {
+        format!("https://{}", index_url)
+    };
+
+    print!("{} Enter resource base path URL (ending with /zip): ", Status::question());
+    io::stdout()
+        .flush()
+        .map_err(|e| format!("Failed to flush stdout: {}", e))?;
+
+    let mut base_url = String::new();
+    io::stdin()
+        .read_line(&mut base_url)
+        .map_err(|e| format!("Failed to read input: {}", e))?;
+
+    let base_url = base_url.trim().to_string();
+    if base_url.is_empty() {
+        return Err("Resource base path URL cannot be empty".to_string());
+    }
+
+    let base_url = if base_url.starts_with("http://") || base_url.starts_with("https://") {
+        base_url
+    } else {
+        format!("https://{}", base_url)
+    };
+
+    let base_url = if base_url.ends_with('/') {
+        base_url
+    } else {
+        format!("{}/", base_url)
+    };
+
+    println!("\n{} Configuration loaded successfully", Status::success());
+    Ok(Config {
+        index_url: index_url.to_string(),
+        zip_bases: vec![base_url],
+    })
+}
+
 pub fn get_config(client: &Client) -> Result<Config, String> {
+    let mode = ask_download_mode(client)?;
+
+    if mode == "custom" {
+        return get_custom_config(client);
+    }
+
     let selected_index_url = fetch_gist(client)?;
 
     #[cfg(windows)]
@@ -404,7 +477,7 @@ pub fn get_config(client: &Client) -> Result<Config, String> {
 
     println!("{} Fetching download configuration...", Status::info());
 
-    let mut response = client
+    let response = client
         .get(&selected_index_url)
         .timeout(Duration::from_secs(30))
         .send()
@@ -414,27 +487,8 @@ pub fn get_config(client: &Client) -> Result<Config, String> {
         return Err(format!("Server error: HTTP {}", response.status()));
     }
 
-    let content_encoding = response
-        .headers()
-        .get("content-encoding")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("");
-
-    let config: Value = if content_encoding.contains("gzip") {
-        let mut buffer = Vec::new();
-        response
-            .copy_to(&mut buffer)
-            .map_err(|e| format!("Error reading response bytes: {}", e))?;
-
-        let mut gz = GzDecoder::new(&buffer[..]);
-        let mut decompressed = String::new();
-        gz.read_to_string(&mut decompressed)
-            .map_err(|e| format!("Error decompressing content: {}", e))?;
-
-        from_str(&decompressed).map_err(|e| format!("Invalid JSON: {}", e))?
-    } else {
-        from_reader(response).map_err(|e| format!("Invalid JSON: {}", e))?
-    };
+    let config_text = decompress_if_gzipped(response)?;
+    let config: Value = from_str(&config_text).map_err(|e| format!("Invalid JSON: {}", e))?;
 
     let has_default = config.get("default").is_some();
     let has_predownload = config.get("predownload").is_some();
@@ -501,12 +555,19 @@ pub fn get_config(client: &Client) -> Result<Config, String> {
             }
         }
     } else {
-        println!("{} CDN list not found. Please enter CDN URLs manually.", Status::warning());
+        println!(
+            "{} CDN list not found. Please enter CDN URLs manually.",
+            Status::warning()
+        );
         print!("{} Enter CDN URLs (comma-separated): ", Status::question());
-        io::stdout().flush().map_err(|e| format!("Failed to flush stdout: {}", e))?;
+        io::stdout()
+            .flush()
+            .map_err(|e| format!("Failed to flush stdout: {}", e))?;
 
         let mut input = String::new();
-        io::stdin().read_line(&mut input).map_err(|e| format!("Failed to read input: {}", e))?;
+        io::stdin()
+            .read_line(&mut input)
+            .map_err(|e| format!("Failed to read input: {}", e))?;
 
         cdn_urls = input
             .trim()
@@ -541,7 +602,7 @@ fn should_skip_download(path: &Path, md5: Option<&str>, size: Option<u64>) -> bo
 }
 
 pub fn fetch_gist(client: &Client) -> Result<String, String> {
-    let mut response = client
+    let response = client
         .get(INDEX_URL)
         .timeout(Duration::from_secs(30))
         .send()
@@ -551,28 +612,13 @@ pub fn fetch_gist(client: &Client) -> Result<String, String> {
         return Err(format!("Server error: HTTP {}", response.status()));
     }
 
-    let content_encoding = response
-        .headers()
-        .get("content-encoding")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("");
-
-    let gist_data: Value = if content_encoding.contains("gzip") {
-        let mut buffer = Vec::new();
-        response
-            .copy_to(&mut buffer)
-            .map_err(|e| format!("Error reading response: {}", e))?;
-        let mut gz = GzDecoder::new(&buffer[..]);
-        let mut decompressed = String::new();
-        gz.read_to_string(&mut decompressed)
-            .map_err(|e| format!("Error decompressing: {}", e))?;
-        from_str(&decompressed).map_err(|e| format!("Invalid JSON: {}", e))?
-    } else {
-        from_reader(response).map_err(|e| format!("Invalid JSON: {}", e))?
-    };
+    let gist_data_text = decompress_if_gzipped(response)?;
+    let gist_data: Value = from_str(&gist_data_text).map_err(|e| format!("Invalid JSON: {}", e))?;
 
     #[cfg(not(target_os = "windows"))]
     Command::new("clear").status().unwrap();
+    #[cfg(windows)]
+    clear().unwrap();
 
     let entries = [
         ("live", "os", "Live - OS"),
@@ -586,39 +632,18 @@ pub fn fetch_gist(client: &Client) -> Result<String, String> {
     for (i, (cat, ver, label)) in entries.iter().enumerate() {
         let index_url = get_version(&gist_data, cat, ver)?;
 
-        let mut resp = client
-            .get(&index_url)
-            .send()
-            .map_err(|e| format!("Error fetching index.json: {}", e))
-            .unwrap();
+        let resp = match client.get(&index_url).send() {
+            Ok(resp) => resp,
+            Err(e) => {
+                println!("{} Failed to fetch {}: {}", Status::warning(), index_url, e);
+                continue;
+            }
+        };
 
         let version_json: Value = {
-            let content_encoding = resp
-                .headers()
-                .get("content-encoding")
-                .and_then(|v| v.to_str().ok())
-                .unwrap_or("");
-
-            if content_encoding.contains("gzip") {
-                let mut buffer = Vec::new();
-                resp.copy_to(&mut buffer)
-                    .map_err(|e| format!("Error reading response: {}", e))
-                    .unwrap();
-
-                let mut gz = GzDecoder::new(&buffer[..]);
-                let mut decompressed = String::new();
-                gz.read_to_string(&mut decompressed)
-                    .map_err(|e| format!("Error decompressing: {}", e))
-                    .unwrap();
-
-                from_str(&decompressed)
-                    .map_err(|e| format!("Invalid JSON: {}", e))
-                    .unwrap()
-            } else {
-                from_reader(resp)
-                    .map_err(|e| format!("Invalid JSON: {}", e))
-                    .unwrap()
-            }
+            let version_text = decompress_if_gzipped(resp)
+                .unwrap_or_else(|_| "{}".to_string());
+            from_str(&version_text).unwrap_or(Value::Null)
         };
 
         let version = version_json

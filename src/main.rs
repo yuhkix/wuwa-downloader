@@ -8,6 +8,31 @@ use std::process::Command;
 #[cfg(windows)]
 use winconsole::console::{clear, set_title};
 
+#[cfg(windows)]
+fn enable_ansi_support() {
+    use std::ffi::c_void;
+    
+    unsafe extern "system" {
+        fn GetStdHandle(std_handle: u32) -> *mut c_void;
+        fn GetConsoleMode(handle: *mut c_void, mode: *mut u32) -> i32;
+        fn SetConsoleMode(handle: *mut c_void, mode: u32) -> i32;
+    }
+    
+    unsafe {
+        const STD_OUTPUT_HANDLE: u32 = 0xFFFFFFF5u32 as u32;
+        const ENABLE_VIRTUAL_TERMINAL_PROCESSING: u32 = 0x0004;
+        
+        let stdout = GetStdHandle(STD_OUTPUT_HANDLE);
+        if !stdout.is_null() {
+            let mut mode: u32 = 0;
+            if GetConsoleMode(stdout, &mut mode) != 0 {
+                mode |= ENABLE_VIRTUAL_TERMINAL_PROCESSING;
+                SetConsoleMode(stdout, mode);
+            }
+        }
+    }
+}
+
 use wuwa_downloader::{
     config::status::Status,
     io::{
@@ -24,7 +49,10 @@ use wuwa_downloader::{
 
 fn main() {
     #[cfg(windows)]
-    set_title("Wuthering Waves Downloader").unwrap();
+    {
+        set_title("Wuthering Waves Downloader").unwrap();
+        enable_ansi_support();
+    }
 
     let log_file = setup_logging();
     let client = Client::new();

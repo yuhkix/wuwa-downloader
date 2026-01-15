@@ -7,13 +7,15 @@ build = "build.rs"
 [dependencies]
 colored = "3.0.0"
 md-5 = "0.10.6"
-reqwest = { version = "0.12.15", features = ["blocking", "json"] }
-serde_json = "1.0.140"
-serde = "1.0.219"
-ctrlc = "3.4.7"
+reqwest = { version = "0.13.1", features = ["blocking", "json"] }
+serde_json = "1.0.149"
+serde = "1.0.228"
+ctrlc = "3.5.1"
 shellexpand = "3.1.1"
-flate2 = "1.1.1"
-indicatif = "0.17.11"
+flate2 = "1.1.8"
+indicatif = "0.18.3"
+rayon = "1.11.0"
+tokio = { version = "1.49.0", features = ["rt-multi-thread", "fs"] }
 
 [target.'cfg(windows)'.dependencies]
 winconsole = "0.11.1"

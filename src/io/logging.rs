@@ -17,5 +17,5 @@ pub fn log_error(mut log_file: &fs::File, message: &str) {
         .duration_since(SystemTime::UNIX_EPOCH)
         .unwrap()
         .as_secs();
-    writeln!(log_file, "[{}] ERROR: {}", timestamp, message).unwrap();
+    let _ = writeln!(log_file, "[{}] ERROR: {}", timestamp, message);
 }

@@ -1,16 +1,17 @@
 use md5::{Digest, Md5};
 use std::{
     fs, io,
-    io::Write,
+    io::{BufReader, Write},
     path::{Path, PathBuf},
 };
 
 use crate::config::status::Status;
 
 pub fn calculate_md5(path: &Path) -> String {
-    let mut file = fs::File::open(path).unwrap();
+    let file = fs::File::open(path).unwrap();
+    let mut reader = BufReader::with_capacity(262144, file);
     let mut hasher = Md5::new();
-    io::copy(&mut file, &mut hasher).unwrap();
+    io::copy(&mut reader, &mut hasher).unwrap();
     format!("{:x}", hasher.finalize())
 }
 

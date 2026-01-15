@@ -59,8 +59,11 @@ fn log_url(url: &str) {
 }
 
 pub fn calculate_total_size(resources: &[Value], client: &Client, config: &Config) -> u64 {
+    use std::collections::HashMap;
+    
     let mut total_size = 0;
     let mut failed_urls = 0;
+    let mut url_cache: HashMap<String, u64> = HashMap::new();
 
     println!("{} Processing files...", Status::info());
 
@@ -72,12 +75,24 @@ pub fn calculate_total_size(resources: &[Value], client: &Client, config: &Confi
             for base_url in &config.zip_bases {
                 let url = format!("{}/{}", base_url, dest);
                 log_url(&url);
-                match client.head(&url).send() {
+                
+                if let Some(&cached_size) = url_cache.get(&url) {
+                    file_size = cached_size;
+                    found_valid_url = true;
+                    break;
+                }
+                
+                match client
+                    .head(&url)
+                    .timeout(Duration::from_secs(15))
+                    .send()
+                {
                     Ok(response) => {
                         if let Some(len) = response.headers().get("content-length") {
                             if let Ok(len_str) = len.to_str() {
                                 if let Ok(len_num) = len_str.parse::<u64>() {
                                     file_size = len_num;
+                                    url_cache.insert(url, len_num);
                                     found_valid_url = true;
                                     break;
                                 }
@@ -128,6 +143,8 @@ pub fn calculate_total_size(resources: &[Value], client: &Client, config: &Confi
 
     #[cfg(not(target_os = "windows"))]
     Command::new("clear").status().unwrap();
+    #[cfg(windows)]
+    clear().unwrap();
 
     total_size
 }
