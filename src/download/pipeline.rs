@@ -326,16 +326,44 @@ pub async fn run_pipeline(
     options: DownloadOptions,
 ) -> PipelineResult {
     let total = resources.len();
+    let total_download_size: u64 = resources.iter().filter_map(|item| item.size).sum();
     let verify_concurrency = options.verify_concurrency.max(1);
     let download_concurrency = options.download_concurrency.max(1);
     let post_verify_concurrency = verify_concurrency;
     let queue_capacity = pipeline_queue_capacity(verify_concurrency, download_concurrency);
 
-    let total_download_size: u64 = resources.iter().filter_map(|item| item.size).sum();
+    let mut items_to_verify = Vec::new();
+    let mut items_to_download = Vec::new();
+
+    for item in resources {
+        if should_stop.load(Ordering::SeqCst) {
+            break;
+        }
+
+        let local_path = folder.join(item.dest.replace('\\', "/"));
+        let needs_verify = match tokio::fs::metadata(&local_path).await {
+            Ok(meta) => {
+                if let Some(expected_size) = item.size {
+                    meta.len() == expected_size
+                } else {
+                    true
+                }
+            }
+            Err(_) => false,
+        };
+
+        if needs_verify {
+            items_to_verify.push(item);
+        } else {
+            items_to_download.push(item);
+        }
+    }
+
+    let num_to_verify = items_to_verify.len();
     let display = Arc::new(ProgressDisplay::new(
         download_concurrency,
         total_download_size,
-        total,
+        num_to_verify,
     ));
     let progress = DownloadProgress {
         total_bytes: Arc::new(AtomicU64::new(total_download_size)),
@@ -345,9 +373,9 @@ pub async fn run_pipeline(
 
     let (event_tx, mut event_rx): (UnboundedSender<PipelineEvent>, UnboundedReceiver<PipelineEvent>) =
         mpsc::unbounded_channel();
-    let (verify_tx, verify_rx) = async_channel::bounded(queue_capacity);
-    let (download_tx, download_rx) = async_channel::bounded(queue_capacity);
-    let (post_verify_tx, post_verify_rx) = async_channel::bounded(queue_capacity);
+    let (verify_tx, verify_rx) = async_channel::unbounded();
+    let (download_tx, download_rx) = async_channel::unbounded();
+    let (post_verify_tx, post_verify_rx) = async_channel::unbounded();
 
     let mut verify_handles = Vec::with_capacity(verify_concurrency);
     for _ in 0..verify_concurrency {
@@ -393,7 +421,7 @@ pub async fn run_pipeline(
     }
     drop(post_verify_rx);
 
-    for item in resources {
+    for item in items_to_verify {
         if should_stop.load(Ordering::SeqCst) {
             break;
         }
@@ -402,6 +430,20 @@ pub async fn run_pipeline(
         }
     }
     drop(verify_tx);
+
+    for item in items_to_download {
+        if should_stop.load(Ordering::SeqCst) {
+            break;
+        }
+        let event = PipelineEvent::NeedDownload(DownloadTask {
+            expected_size: item.size.unwrap_or(0),
+            item,
+            attempt: 0,
+        });
+        if event_tx.send(event).is_err() {
+            break;
+        }
+    }
     drop(event_tx);
 
     let mut result = PipelineResult {
