@@ -10,6 +10,7 @@ use std::{
     time::Duration,
 };
 use tokio::io::AsyncWriteExt;
+use tokio::time::sleep;
 
 #[cfg(windows)]
 use winconsole::console::clear;
@@ -17,7 +18,7 @@ use winconsole::console::clear;
 use crate::config::cfg::Config;
 use crate::config::status::Status;
 use crate::download::progress::DownloadProgress;
-use crate::io::file::{calculate_md5, check_existing_file, file_size, get_filename};
+use crate::io::file::{calculate_md5, file_size, get_filename};
 use crate::io::logging::{SharedLogFile, log_error};
 use crate::io::util::get_version;
 
@@ -164,6 +165,29 @@ fn rollback_counted_bytes(
     *counted_bytes_for_file = 0;
 }
 
+async fn wait_for_stop(should_stop: &std::sync::atomic::AtomicBool) {
+    while !should_stop.load(std::sync::atomic::Ordering::SeqCst) {
+        sleep(Duration::from_millis(100)).await;
+    }
+}
+
+fn count_total_progress(
+    progress: &DownloadProgress,
+    total_pb: &ProgressBar,
+    counted_bytes_for_file: &mut u64,
+    amount: u64,
+) {
+    if amount == 0 {
+        return;
+    }
+
+    progress
+        .downloaded_bytes
+        .fetch_add(amount, std::sync::atomic::Ordering::SeqCst);
+    total_pb.inc(amount);
+    *counted_bytes_for_file += amount;
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn download_single_file(
     client: &Client,
@@ -190,7 +214,10 @@ async fn download_single_file(
         request
     };
 
-    let mut response = match request.send().await {
+    let mut response = match tokio::select! {
+        _ = wait_for_stop(should_stop) => return DownloadAttemptResult::Interrupted,
+        resp = request.send() => resp,
+    } {
         Ok(resp) => resp,
         Err(e) => return DownloadAttemptResult::Retryable(format!("Network error: {}", e)),
     };
@@ -220,6 +247,9 @@ async fn download_single_file(
     if append_mode {
         options.append(true);
         task_pb.set_position(local_size);
+        if *counted_bytes_for_file == 0 {
+            count_total_progress(progress, total_pb, counted_bytes_for_file, local_size);
+        }
     } else {
         options.write(true).truncate(true);
         task_pb.set_position(0);
@@ -235,7 +265,10 @@ async fn download_single_file(
             return DownloadAttemptResult::Interrupted;
         }
 
-        let chunk = match response.chunk().await {
+        let chunk = match tokio::select! {
+            _ = wait_for_stop(should_stop) => return DownloadAttemptResult::Interrupted,
+            chunk = response.chunk() => chunk,
+        } {
             Ok(Some(chunk)) => chunk,
             Ok(None) => break,
             Err(e) => return DownloadAttemptResult::Retryable(format!("Read error: {}", e)),
@@ -247,11 +280,7 @@ async fn download_single_file(
 
         let size = chunk.len() as u64;
         task_pb.inc(size);
-        total_pb.inc(size);
-        *counted_bytes_for_file += size;
-        progress
-            .downloaded_bytes
-            .fetch_add(size, std::sync::atomic::Ordering::SeqCst);
+        count_total_progress(progress, total_pb, counted_bytes_for_file, size);
     }
 
     if let Err(e) = file.flush().await {
@@ -416,12 +445,59 @@ pub async fn download_file(
         task_pb.set_length(0);
     }
 
-    if let (Some(md5), Some(size)) = (expected_md5, expected_size)
-        && check_existing_file(&path, Some(md5), Some(size)).await
-    {
-        task_pb.set_position(size);
-        task_pb.set_message(format!("already valid: {}", filename.bright_purple()));
-        return true;
+    // === 사전 삭제 로직: 오염/초과 파일 감지 및 제거 ===
+    let mut force_full_download = false;
+    if let Some(expected) = expected_size {
+        let local_size = file_size(&path).await;
+        if local_size > 0 {
+            if local_size == expected {
+                // 크기 동일 → MD5 검증
+                if let Some(md5) = expected_md5 {
+                    match calculate_md5(&path).await {
+                        Ok(actual) if actual == md5 => {
+                            // 이미 유효한 파일 → 스킵
+                            task_pb.set_position(expected);
+                            task_pb.set_message(format!(
+                                "already valid: {}",
+                                filename.bright_purple()
+                            ));
+                            return true;
+                        }
+                        _ => {
+                            // 해시 불일치 → 사전 삭제
+                            log_error(
+                                log_file,
+                                &format!(
+                                    "Corrupted file detected, deleting: {}",
+                                    normalized_dest
+                                ),
+                            );
+                            remove_partial_file(&path).await;
+                            task_pb.set_position(0);
+                            force_full_download = true;
+                        }
+                    }
+                } else {
+                    // MD5 없고 크기 동일 → 유효로 간주
+                    task_pb.set_position(expected);
+                    task_pb.set_message(format!(
+                        "already valid: {}",
+                        filename.bright_purple()
+                    ));
+                    return true;
+                }
+            } else if local_size > expected {
+                // 로컬이 더 큼 → 삭제 후 새로 다운로드
+                log_error(
+                    log_file,
+                    &format!("Oversized file detected, deleting: {}", normalized_dest),
+                );
+                remove_partial_file(&path).await;
+                task_pb.set_position(0);
+                force_full_download = true;
+            }
+            // local_size < expected → 기존 이어받기 로직 유지
+        }
     }
 
     if let Some(parent) = path.parent()
@@ -435,6 +511,7 @@ pub async fn download_file(
         return false;
     }
 
+    let allow_resume = !force_full_download;
     let first_pass = try_download_with_cdns(
         client,
         config,
@@ -445,7 +522,7 @@ pub async fn download_file(
         progress,
         total_pb,
         task_pb,
-        true,
+        allow_resume,
         &mut counted_bytes_for_file,
     )
     .await;
@@ -504,79 +581,6 @@ pub async fn download_file(
                 &format!("All CDNs failed for {}: {}", normalized_dest, err),
             );
             return false;
-        }
-    }
-
-    if let Some(expected) = expected_md5 {
-        if should_stop.load(std::sync::atomic::Ordering::SeqCst) {
-            return false;
-        }
-
-        let actual = match calculate_md5(&path).await {
-            Ok(hash) => hash,
-            Err(err) => {
-                log_error(log_file, &format!("Checksum calculation failed: {}", err));
-                return false;
-            }
-        };
-
-        if actual != expected {
-            log_error(
-                log_file,
-                &format!(
-                    "Checksum failed for {}: expected {}, got {}",
-                    normalized_dest, expected, actual
-                ),
-            );
-            rollback_counted_bytes(progress, total_pb, &mut counted_bytes_for_file);
-            remove_partial_file(&path).await;
-            task_pb.set_position(0);
-            task_pb.set_message(format!(
-                "checksum mismatch, redownloading {}",
-                filename.red()
-            ));
-
-            match try_download_with_cdns(
-                client,
-                config,
-                &normalized_dest,
-                &path,
-                log_file,
-                should_stop,
-                progress,
-                total_pb,
-                task_pb,
-                false,
-                &mut counted_bytes_for_file,
-            )
-            .await
-            {
-                CdnDownloadResult::Success => {
-                    let second_hash = match calculate_md5(&path).await {
-                        Ok(hash) => hash,
-                        Err(err) => {
-                            log_error(log_file, &format!("Checksum recheck failed: {}", err));
-                            return false;
-                        }
-                    };
-
-                    if second_hash != expected {
-                        log_error(
-                            log_file,
-                            &format!(
-                                "Checksum failed after redownload for {}: expected {}, got {}",
-                                normalized_dest, expected, second_hash
-                            ),
-                        );
-                        remove_partial_file(&path).await;
-                        return false;
-                    }
-                }
-                CdnDownloadResult::Interrupted => return false,
-                CdnDownloadResult::RetryWithoutResume | CdnDownloadResult::Failed(_) => {
-                    return false;
-                }
-            }
         }
     }
 
