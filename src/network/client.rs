@@ -756,16 +756,59 @@ pub async fn get_config(client: &Client) -> Result<Config, String> {
         .ok_or("Missing or invalid indexFile")?;
 
     let mut cdn_urls = Vec::new();
-    if let Some(cdn_list) = config_data.get("cdnList").and_then(Value::as_array) {
+    let mut cdn_list_opt = config_data.get("cdnList").and_then(Value::as_array);
+
+    if cdn_list_opt.is_none() || cdn_list_opt.unwrap().is_empty() {
+        let other_config = if selected_config == "default" { "predownload" } else { "default" };
+        if let Some(other_data) = config.get(other_config) {
+            if let Some(list) = other_data.get("cdnList").and_then(Value::as_array) {
+                if !list.is_empty() {
+                    println!(
+                        "{} CDN list missing in '{}', but found in '{}'.",
+                        Status::warning(),
+                        selected_config,
+                        other_config
+                    );
+                    
+                    loop {
+                        print!("{} Do you want to use the CDN list from '{}'? [Y/n]: ", Status::question(), other_config);
+                        io::stdout()
+                            .flush()
+                            .map_err(|e| format!("Failed to flush stdout: {}", e))?;
+
+                        let mut input = String::new();
+                        io::stdin()
+                            .read_line(&mut input)
+                            .map_err(|e| format!("Failed to read input: {}", e))?;
+
+                        match input.trim().to_lowercase().as_str() {
+                            "y" | "yes" | "" => {
+                                cdn_list_opt = Some(list);
+                                break;
+                            }
+                            "n" | "no" => {
+                                break;
+                            }
+                            _ => println!("{} Invalid choice, please press Enter for Yes, or 'n' for No", Status::error()),
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if let Some(cdn_list) = cdn_list_opt {
         for cdn in cdn_list {
             if let Some(url) = cdn.get("url").and_then(Value::as_str) {
                 cdn_urls.push(url.trim_end_matches('/').to_string());
             }
         }
-    } else {
+    }
+
+    if cdn_urls.is_empty() {
         println!(
-            "{} CDN list not found. Please enter CDN URLs manually.",
-            Status::warning()
+            "{} Please enter CDN URLs manually.",
+            Status::info()
         );
         print!("{} Enter CDN URLs (comma-separated): ", Status::question());
         io::stdout()
