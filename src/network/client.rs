@@ -149,8 +149,9 @@ async fn count_total_progress(
     total_pb: &ProgressBar,
     counted_bytes_for_file: &mut u64,
     amount: u64,
+    track_total: bool,
 ) {
-    if amount == 0 {
+    if amount == 0 || !track_total {
         return;
     }
 
@@ -169,6 +170,7 @@ async fn download_single_file(
     task_pb: &ProgressBar,
     allow_resume: bool,
     counted_bytes_for_file: &mut u64,
+    track_total: bool,
 ) -> DownloadAttemptResult {
     let local_size = file_size(path).await;
     let use_range = allow_resume && local_size > 0;
@@ -218,7 +220,14 @@ async fn download_single_file(
         options.append(true);
         task_pb.set_position(local_size);
         if *counted_bytes_for_file == 0 {
-            count_total_progress(progress, total_pb, counted_bytes_for_file, local_size).await;
+            count_total_progress(
+                progress,
+                total_pb,
+                counted_bytes_for_file,
+                local_size,
+                track_total,
+            )
+            .await;
         }
     } else {
         options.write(true).truncate(true);
@@ -250,7 +259,14 @@ async fn download_single_file(
 
         let size = chunk.len() as u64;
         task_pb.inc(size);
-        count_total_progress(progress, total_pb, counted_bytes_for_file, size).await;
+        count_total_progress(
+            progress,
+            total_pb,
+            counted_bytes_for_file,
+            size,
+            track_total,
+        )
+        .await;
     }
 
     if let Err(e) = file.flush().await {
@@ -273,6 +289,7 @@ async fn try_download_with_cdns(
     task_pb: &ProgressBar,
     allow_resume: bool,
     counted_bytes_for_file: &mut u64,
+    track_total: bool,
 ) -> CdnDownloadResult {
     let mut saw_range_unsupported = false;
     let mut last_error = "Unknown error".to_string();
@@ -301,6 +318,7 @@ async fn try_download_with_cdns(
                 task_pb,
                 allow_resume,
                 counted_bytes_for_file,
+                track_total,
             )
             .await;
 
@@ -407,6 +425,7 @@ pub async fn download_file(
     let path = folder.join(&normalized_dest);
     let filename = get_filename(&normalized_dest);
     let mut counted_bytes_for_file = 0_u64;
+    let track_total = expected_size.is_some();
 
     if let Some(total) = expected_size {
         task_pb.set_length(total);
@@ -437,6 +456,7 @@ pub async fn download_file(
         task_pb,
         true,
         &mut counted_bytes_for_file,
+        track_total,
     )
     .await;
 
@@ -464,6 +484,7 @@ pub async fn download_file(
                 task_pb,
                 false,
                 &mut counted_bytes_for_file,
+                track_total,
             )
             .await
             {

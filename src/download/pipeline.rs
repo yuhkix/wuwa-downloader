@@ -279,10 +279,12 @@ async fn post_verify_worker(
             continue;
         }
 
-        let bytes_to_rollback = file_size(&path).await;
-        progress
-            .rollback_downloaded_bytes(&display.total_bar, bytes_to_rollback)
-            .await;
+        if task.item.size.is_some() {
+            let bytes_to_rollback = file_size(&path).await;
+            progress
+                .rollback_downloaded_bytes(&display.total_bar, bytes_to_rollback)
+                .await;
+        }
         remove_file_if_exists(&path).await;
 
         if task.attempt < MAX_PIPELINE_RETRIES {
