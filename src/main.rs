@@ -3,6 +3,7 @@ use reqwest::Client;
 
 #[cfg(not(target_os = "windows"))]
 use std::process::Command;
+use std::sync::atomic::Ordering;
 
 #[cfg(windows)]
 use winconsole::console::{clear, set_title};
@@ -34,14 +35,12 @@ fn enable_ansi_support() {
 
 use wuwa_downloader::{
     config::status::Status,
+    download::pipeline::run_pipeline,
     io::{
         console::print_results,
         file::get_dir,
         logging::setup_logging,
-        util::{
-            ask_concurrency, calculate_total_size, download_resources, exit_with_error,
-            parse_resources, setup_ctrlc, start_title_thread, track_progress,
-        },
+        util::{ask_concurrency, exit_with_error, parse_resources, setup_ctrlc},
     },
     network::client::{fetch_index, get_config},
 };
@@ -67,8 +66,17 @@ async fn main() {
         Err(e) => exit_with_error(&log_file, &e),
     };
 
-    let folder = get_dir();
-    let options = ask_concurrency();
+    let folder = match get_dir() {
+        Ok(folder) => folder,
+        Err(e) => exit_with_error(
+            &log_file,
+            &format!("Failed to read download directory: {}", e),
+        ),
+    };
+    let options = match ask_concurrency() {
+        Ok(options) => options,
+        Err(e) => exit_with_error(&log_file, &format!("Failed to read concurrency: {}", e)),
+    };
 
     #[cfg(windows)]
     clear().unwrap();
@@ -81,12 +89,20 @@ async fn main() {
         folder.display().to_string().cyan()
     );
     println!(
-        "{} Concurrency: {}\n",
+        "{} Download concurrency: {}",
         Status::info(),
-        options.concurrency.to_string().cyan()
+        options.download_concurrency.to_string().cyan()
+    );
+    println!(
+        "{} Verify concurrency: {}\n",
+        Status::info(),
+        options.verify_concurrency.to_string().cyan()
     );
 
-    let data = fetch_index(&client, &config, &log_file).await;
+    let data = match fetch_index(&client, &config, &log_file).await {
+        Ok(data) => data,
+        Err(e) => exit_with_error(&log_file, &e),
+    };
     let resources = match parse_resources(&data) {
         Ok(resources) => resources,
         Err(err) => exit_with_error(&log_file, &err),
@@ -97,44 +113,26 @@ async fn main() {
         Status::info(),
         resources.len().to_string().cyan()
     );
-    let total_files = resources.len();
-
-    let (total_size, size_hints) =
-        calculate_total_size(&resources, &client, &config, &folder).await;
-    let (should_stop, success, progress) = track_progress(total_size);
-
-    let title_thread = start_title_thread(
-        should_stop.clone(),
-        success.clone(),
-        progress.clone(),
-        resources.len(),
-    );
-
+    let should_stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     setup_ctrlc(should_stop.clone());
 
-    download_resources(
+    let result = run_pipeline(
         std::sync::Arc::new(client),
         std::sync::Arc::new(config),
         resources,
-        std::sync::Arc::new(size_hints),
         folder.clone(),
         log_file.clone(),
         should_stop.clone(),
-        progress,
-        success.clone(),
         options,
     )
     .await;
 
-    should_stop.store(true, std::sync::atomic::Ordering::SeqCst);
-    let _ = title_thread.join();
-
     #[cfg(windows)]
     clear().unwrap();
 
-    print_results(
-        success.load(std::sync::atomic::Ordering::SeqCst),
-        total_files,
-        &folder,
-    );
+    print_results(&result, &folder);
+
+    if should_stop.load(Ordering::SeqCst) {
+        std::process::exit(130);
+    }
 }

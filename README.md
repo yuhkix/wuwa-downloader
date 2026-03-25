@@ -28,11 +28,12 @@ High-performance, resilient downloader for Wuthering Waves with multi-CDN fallba
 ## ✨ Features
 - **Multi-CDN fallback**: Automatically tries multiple mirrors on failures
 - **Interactive version selection**: Choose Live/Beta and OS/CN variants
-- **Integrity checks**: Per-file MD5 verification; corrupted files are removed
+- **Pipeline downloads**: Verification workers and download workers run concurrently
+- **Integrity checks**: Per-file MD5 verification; corrupted or oversized files are deleted before download
 - **Smart retries**: Up to 3 retry attempts per CDN with robust timeouts
-- **Streaming downloads**: Chunked I/O for low memory usage
-- **Clear progress**: Per-file progress bars with speed, ETA, totals
-- **Graceful interrupt**: CTRL-C to stop safely with a final summary
+- **Streaming downloads**: Chunked I/O with resume support when possible
+- **Clear progress**: Verification bar, total download bar, and per-worker progress bars
+- **Graceful interrupt**: CTRL-C to stop safely with a final summary including unprocessed files
 - **Detailed logs**: Errors recorded with timestamps in `logs.log`
 
 ## 📦 Requirements
@@ -59,32 +60,47 @@ cargo build --release
 ### Workflow
 1. Select a version to download (Live/Beta and OS/CN)
 2. Choose a download directory or press Enter for current directory
-3. Wait for index fetching and size estimation
-4. Monitor download progress with progress bars
-5. Review final summary and press Enter to exit
+3. Enter the number of concurrent download workers or press Enter to use the default
+4. Enter the number of concurrent verification workers or press Enter to use the default
+5. Wait for the index file to be fetched and parsed
+6. Monitor verification and download progress in the multi-bar UI
+7. Review the final summary:
+   - Successfully verified
+   - Successfully downloaded
+   - Failed
+   - Unprocessed
+   - Total files
+8. Press Enter to exit only when there are no unprocessed files
 
 ## 🔍 Technical Details
 ### How It Works
 - Remote config discovery via JSON
 - Index parsing for resource listing
-- HEAD request preflight checks
-- Range-based downloads with resume capability
-- MD5 checksum validation
+- Index `size` metadata is used instead of per-file HEAD preflight checks
+- Verification workers validate local files before enqueueing downloads
+- Download workers consume a shared queue with resume and CDN fallback support
+- MD5 checksum validation and pre-delete handling for corrupted files
 
 ### Key Components
 - `src/network/client.rs`: Config and download management
-- `src/io/util.rs`: Progress tracking and formatting
+- `src/io/util.rs`: Resource parsing, prompts, and process control helpers
 - `src/io/file.rs`: File operations and path handling
 - `src/io/logging.rs`: Error logging system
-- `src/download/progress.rs`: Progress state management
+- `src/download/progress.rs`: Multi-progress UI state
+- `src/download/pipeline.rs`: Pipeline controller, verification workers, and download workers
 
 ## ⚙️ Configuration
 - **Retry Policy**: 3 attempts per CDN
-- **Timeouts**: 30s for metadata, extended for transfers
+- **Worker Defaults**:
+  - Verification workers: `8`
+  - Download workers: `4`
+- **Timeouts**: 30s for index/config fetches, extended timeout for transfers
 - **Logging**: 
   - Errors: `logs.log`
-  - URLs: `urls.txt` (optional)
-- **Progress**: Live window title updates (Windows)
+- **Progress**:
+  - Verification progress bar
+  - Total download progress bar
+  - Per-download-worker progress bars
 
 ## 📚 Documentation
 For detailed guides, workflow overview, and deeper technical explanations, see the [official documentation](https://deepwiki.com/yuhkix/wuwa-downloader/).
@@ -92,13 +108,14 @@ For detailed guides, workflow overview, and deeper technical explanations, see t
 ## ❓ FAQ
 - **Download location?** User-selected at runtime
 - **Safe interruption?** Yes, via CTRL-C
+- **What happens on interruption?** Completed files are kept; the summary shows failed and unprocessed counts separately
 - **Why MD5?** Matches upstream checksums for integrity
 
 ## 🧪 Development
 ### Environment Setup
 - **Required**: Rust nightly (1.87.0-nightly+)
 - **Dependencies**: 
-  - `reqwest` (blocking)
+  - `reqwest`
   - `indicatif`
   - `flate2`
   - `colored`

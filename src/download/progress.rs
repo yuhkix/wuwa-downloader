@@ -13,12 +13,48 @@ use tokio::sync::{Mutex, Notify};
 pub struct DownloadProgress {
     pub total_bytes: Arc<AtomicU64>,
     pub downloaded_bytes: Arc<AtomicU64>,
+    pub(crate) total_bar_lock: Arc<Mutex<()>>,
     pub start_time: Instant,
 }
 
 impl DownloadProgress {
     pub fn downloaded(&self) -> u64 {
         self.downloaded_bytes.load(Ordering::SeqCst)
+    }
+
+    pub async fn add_downloaded_bytes(&self, total_bar: &ProgressBar, amount: u64) {
+        if amount == 0 {
+            return;
+        }
+
+        let _guard = self.total_bar_lock.lock().await;
+        let next = self
+            .downloaded_bytes
+            .fetch_add(amount, Ordering::SeqCst)
+            .saturating_add(amount);
+        total_bar.set_position(next);
+    }
+
+    pub async fn rollback_downloaded_bytes(&self, total_bar: &ProgressBar, amount: u64) {
+        if amount == 0 {
+            return;
+        }
+
+        let _guard = self.total_bar_lock.lock().await;
+        let mut current = self.downloaded_bytes.load(Ordering::SeqCst);
+        let next = loop {
+            let next = current.saturating_sub(amount);
+            match self.downloaded_bytes.compare_exchange(
+                current,
+                next,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            ) {
+                Ok(_) => break next,
+                Err(observed) => current = observed,
+            }
+        };
+        total_bar.set_position(next);
     }
 }
 
@@ -79,26 +115,46 @@ impl ProgressSlotPool {
 
 #[derive(Clone)]
 pub struct ProgressDisplay {
+    pub status_bar: ProgressBar,
+    pub verify_bar: ProgressBar,
     pub total_bar: ProgressBar,
     pub slot_pool: ProgressSlotPool,
     _multi: Arc<MultiProgress>,
 }
 
 impl ProgressDisplay {
-    pub fn new(concurrency: usize, total_size: u64) -> Self {
+    pub fn new(download_concurrency: usize, total_download_size: u64, total_files: usize) -> Self {
         let multi = Arc::new(MultiProgress::new());
 
-        let total_bar = multi.add(ProgressBar::new(total_size));
-        total_bar
-            .set_style(
-                ProgressStyle::default_bar()
-                    .template("{spinner:.green} [TOTAL] [{wide_bar:.cyan/blue}] {bytes}/{total_bytes} ({eta}, {binary_bytes_per_sec})")
-                    .unwrap()
-                    .progress_chars("#>-"),
-            );
+        let status_bar = multi.add(ProgressBar::new_spinner());
+        status_bar.set_style(
+            ProgressStyle::default_spinner()
+                .template("{spinner:.yellow} [STATUS] {msg}")
+                .unwrap(),
+        );
+        status_bar.set_message("running");
 
-        let mut bars = Vec::with_capacity(concurrency);
-        for idx in 0..concurrency {
+        // Verification progress bar (top)
+        let verify_bar = multi.add(ProgressBar::new(total_files as u64));
+        verify_bar.set_style(
+            ProgressStyle::default_bar()
+                .template("{spinner:.green} [VERIFY] [{wide_bar:.magenta/blue}] {pos}/{len} files ({eta})")
+                .unwrap()
+                .progress_chars("#>-"),
+        );
+
+        // Total download progress bar
+        let total_bar = multi.add(ProgressBar::new(total_download_size));
+        total_bar.set_style(
+            ProgressStyle::default_bar()
+                .template("{spinner:.green} [TOTAL] [{wide_bar:.cyan/blue}] {bytes}/{total_bytes} ({eta}, {binary_bytes_per_sec})")
+                .unwrap()
+                .progress_chars("#>-"),
+        );
+
+        // Per-worker download slot bars (bottom)
+        let mut bars = Vec::with_capacity(download_concurrency);
+        for idx in 0..download_concurrency {
             let bar = multi.add(ProgressBar::new(0));
             bar.set_style(
                 ProgressStyle::default_bar()
@@ -106,12 +162,14 @@ impl ProgressDisplay {
                     .unwrap()
                     .progress_chars("#>-"),
             );
-            bar.set_prefix(format!("TASK {:02}", idx + 1));
+            bar.set_prefix(format!("DL {:02}", idx + 1));
             bar.set_message("idle");
             bars.push(bar);
         }
 
         Self {
+            status_bar,
+            verify_bar,
             total_bar,
             slot_pool: ProgressSlotPool::new(bars),
             _multi: multi,

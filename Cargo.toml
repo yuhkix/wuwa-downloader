@@ -5,6 +5,7 @@ edition = "2024"
 build = "build.rs"
 
 [dependencies]
+async-channel = "2.5.0"
 colored = "3.0.0"
 md-5 = "0.10.6"
 reqwest = { version = "0.13.1", features = ["json", "stream", "gzip"] }

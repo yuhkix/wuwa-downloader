@@ -6,12 +6,16 @@ pub struct Config {
 
 #[derive(Clone)]
 pub struct DownloadOptions {
-    pub concurrency: usize,
+    pub verify_concurrency: usize,
+    pub download_concurrency: usize,
 }
 
 impl Default for DownloadOptions {
     fn default() -> Self {
-        Self { concurrency: 4 }
+        Self {
+            verify_concurrency: 8,
+            download_concurrency: 4,
+        }
     }
 }
 
@@ -19,4 +23,5 @@ impl Default for DownloadOptions {
 pub struct ResourceItem {
     pub dest: String,
     pub md5: Option<String>,
+    pub size: Option<u64>,
 }
