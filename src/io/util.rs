@@ -152,13 +152,26 @@ pub fn get_version(data: &Value, category: &str, version: &str) -> Result<String
 pub fn exit_with_error(log_file: &SharedLogFile, error: &str) -> ! {
     log_error(log_file, error);
 
-    #[cfg(windows)]
-    clear().unwrap();
+    clear_screen();
 
     println!("{} {}", Status::error(), error);
     println!("\n{} Press Enter to exit...", Status::warning());
     let _ = io::stdin().read_line(&mut String::new());
     std::process::exit(1);
+}
+
+fn clear_screen() {
+    #[cfg(windows)]
+    {
+        let _ = std::process::Command::new("cmd")
+            .args(["/C", "cls"])
+            .status();
+    }
+
+    #[cfg(not(windows))]
+    {
+        let _ = std::process::Command::new("clear").status();
+    }
 }
 
 pub fn setup_ctrlc(should_stop: Arc<std::sync::atomic::AtomicBool>) {
