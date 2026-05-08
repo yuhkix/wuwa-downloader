@@ -7,6 +7,9 @@ use std::{
     sync::atomic::{AtomicUsize, Ordering},
 };
 
+#[cfg(windows)]
+use winconsole::console::clear;
+
 use crate::{
     config::{
         cfg::{DownloadOptions, ResourceItem},
@@ -160,12 +163,10 @@ pub fn exit_with_error(log_file: &SharedLogFile, error: &str) -> ! {
     std::process::exit(1);
 }
 
-fn clear_screen() {
+pub fn clear_screen() {
     #[cfg(windows)]
     {
-        let _ = std::process::Command::new("cmd")
-            .args(["/C", "cls"])
-            .status();
+        let _ = clear();
     }
 
     #[cfg(not(windows))]

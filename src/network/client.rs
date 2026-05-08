@@ -2,8 +2,6 @@ use colored::Colorize;
 use indicatif::ProgressBar;
 use reqwest::{Client, StatusCode};
 use serde_json::{Value, from_str};
-#[cfg(not(target_os = "windows"))]
-use std::process::Command;
 use std::{
     io::{self, Write},
     path::Path,
@@ -13,15 +11,12 @@ use std::{
 use tokio::io::AsyncWriteExt;
 use tokio::time::sleep;
 
-#[cfg(windows)]
-use winconsole::console::clear;
-
 use crate::config::cfg::Config;
 use crate::config::status::Status;
 use crate::download::progress::DownloadProgress;
 use crate::io::file::{file_size, get_filename};
 use crate::io::logging::{SharedLogFile, log_error};
-use crate::io::util::{get_version, read_line};
+use crate::io::util::{clear_screen, get_version, read_line};
 
 const INDEX_URL: &str = "https://gist.githubusercontent.com/yuhkix/b8796681ac2cd3bab11b7e8cdc022254/raw/4435fd290c07f7f766a6d2ab09ed3096d83b02e3/wuwa.json";
 const MAX_RETRIES: usize = 3;
@@ -41,18 +36,6 @@ enum CdnDownloadResult {
     RetryWithoutResume,
     Failed(String),
     Interrupted,
-}
-
-fn clear_screen() {
-    #[cfg(windows)]
-    {
-        clear().unwrap();
-    }
-
-    #[cfg(not(target_os = "windows"))]
-    {
-        Command::new("clear").status().unwrap();
-    }
 }
 
 pub fn build_download_url(base_url: &str, dest: &str) -> String {
